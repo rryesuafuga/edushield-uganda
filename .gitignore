@@ -6,10 +6,8 @@ __pycache__/
 *.pyd
 *.ipynb_checkpoints/
 
-# Ignore data
-data/raw/
+# Ignore processed data
 data/processed/
-models/
 
 # Ignore environment files
 .env
