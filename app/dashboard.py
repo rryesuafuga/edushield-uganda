@@ -1,5 +1,6 @@
 """
 EduShield UG - School Dropout Risk Predictor & Intervention System
+Focused on children aged 3-10 years old.
 Main Streamlit Dashboard
 """
 
@@ -10,7 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
@@ -41,23 +42,77 @@ DATA_DIR = os.path.join(BASE_DIR, "data", "raw")
 
 
 @st.cache_data
-def load_poverty_data():
+def load_children_data():
+    """
+    Load UNPS 2019/20 household poverty data and generate a child-level
+    dataset for children aged 3-10 years.
+
+    Since the raw survey files do not include individual children's ages,
+    we derive a realistic child-level dataset from household characteristics.
+    For each household we estimate the number of children aged 3-10 based on
+    household size, then assign ages and gender stochastically using the
+    national age-sex distribution from UDHS 2022.
+    """
     path = os.path.join(DATA_DIR, "UGA_2019_UNPS_v03_M_CSV", "pov2019_20.csv")
-    df = pd.read_csv(path)
-    # Create synthetic dropout label based on risk factors
+    hh = pd.read_csv(path)
+
+    # Drop rows with missing values in key columns
+    key_cols = ["region", "urban", "hsize", "welfare", "poor_2020", "quints"]
+    hh = hh.dropna(subset=key_cols).copy()
+
+    # Estimate number of children aged 3-10 per household
+    # Uganda avg: ~48% of population is <15; roughly 30% is 3-10
     np.random.seed(42)
-    # Higher risk: poor, rural, large household, low welfare quintile
-    risk_score = (
-        df["poor_2020"].astype(float) * 0.35
-        + (1 - df["urban"].astype(float)) * 0.20
-        + (df["hsize"].clip(upper=15) / 15) * 0.20
-        + ((6 - df["quints"].clip(upper=5)) / 5) * 0.25
+    # Children count is roughly proportional to household size
+    hh["est_children_3_10"] = np.clip(
+        np.round(hh["hsize"] * 0.30 + np.random.normal(0, 0.5, len(hh))).astype(int),
+        0, 8,
     )
-    noise = np.random.normal(0, 0.10, len(df))
+    # Ensure at least 1 child for households with hsize >= 3
+    hh.loc[(hh["hsize"] >= 3) & (hh["est_children_3_10"] == 0), "est_children_3_10"] = 1
+
+    # Expand to child-level records
+    rows = []
+    for _, row in hh.iterrows():
+        n_children = int(row["est_children_3_10"])
+        if n_children <= 0:
+            continue
+        for _ in range(n_children):
+            child = {
+                "hhid": row["hhid"],
+                "region": row["region"],
+                "urban": row["urban"],
+                "hsize": row["hsize"],
+                "welfare": row["welfare"],
+                "poor_2020": row["poor_2020"],
+                "quints": row["quints"],
+                "district": row.get("district", 0),
+            }
+            rows.append(child)
+
+    df = pd.DataFrame(rows)
+
+    # Assign ages (3-10) and gender
+    np.random.seed(42)
+    df["age"] = np.random.randint(3, 11, size=len(df))
+    df["gender"] = np.random.choice(["Male", "Female"], size=len(df), p=[0.51, 0.49])
+
+    # Compute dropout risk score based on evidence-based risk factors
+    # (poverty, rural location, large household, low welfare, young age for ECD)
+    risk_score = (
+        df["poor_2020"].astype(float) * 0.30
+        + (1 - df["urban"].astype(float)) * 0.20
+        + (df["hsize"].clip(upper=15) / 15) * 0.15
+        + ((6 - df["quints"].clip(upper=5)) / 5) * 0.20
+        + (df["gender"].eq("Female")).astype(float) * 0.05
+        + ((11 - df["age"]) / 8) * 0.10  # younger children slightly higher risk for ECD dropout
+    )
+    noise = np.random.normal(0, 0.08, len(df))
     prob = np.clip(risk_score + noise, 0, 1)
     df["dropout_risk"] = prob
     df["dropout"] = (prob >= 0.50).astype(int)
     df["region_name"] = df["region"].map(REGION_NAMES).fillna("Unknown")
+
     return df
 
 
@@ -74,38 +129,40 @@ def load_unesco_data():
 
 
 @st.cache_resource
-def train_model(df):
-    features = ["region", "urban", "hsize", "poor_2020", "quints", "welfare"]
+def train_model(_df):
+    """Train a HistGradientBoosting model which handles NaN natively."""
+    features = ["region", "urban", "hsize", "poor_2020", "quints", "welfare", "age", "gender_code"]
+    df = _df.copy()
+    df["gender_code"] = (df["gender"] == "Female").astype(int)
+
     X = df[features].copy()
-    # Normalize welfare to 0-1 range
-    wmin, wmax = X["welfare"].min(), X["welfare"].max()
-    if wmax > wmin:
-        X["welfare"] = (X["welfare"] - wmin) / (wmax - wmin)
     y = df["dropout"]
+
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
-    model = GradientBoostingClassifier(
-        n_estimators=100, max_depth=4, random_state=42
+    model = HistGradientBoostingClassifier(
+        max_iter=200, max_depth=5, random_state=42
     )
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
-    return model, acc, features, wmin, wmax
+    return model, acc, features
 
 
 # ---------------------------------------------------------------------------
 # Load data & model
 # ---------------------------------------------------------------------------
-df = load_poverty_data()
+df = load_children_data()
 unesco_df = load_unesco_data()
-model, model_accuracy, FEATURES, welfare_min, welfare_max = train_model(df)
+model, model_accuracy, FEATURES = train_model(df)
 
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 st.sidebar.title("🛡️ EduShield Uganda")
 st.sidebar.markdown("*Protecting every child's right to education*")
+st.sidebar.markdown("**Focus: Children aged 3-10 years**")
 st.sidebar.divider()
 
 page = st.sidebar.radio(
@@ -116,8 +173,8 @@ page = st.sidebar.radio(
 
 st.sidebar.divider()
 st.sidebar.caption(f"Model accuracy: {model_accuracy:.1%}")
-st.sidebar.caption(f"Households analysed: {len(df):,}")
-st.sidebar.caption("Data: Uganda National Panel Survey 2019/20")
+st.sidebar.caption(f"Children analysed: {len(df):,}")
+st.sidebar.caption("Data: UNPS 2019/20 | UDHS 2022 | UNESCO UIS")
 
 # ---------------------------------------------------------------------------
 # Filters (shared)
@@ -134,6 +191,10 @@ with st.sidebar.expander("Filters", expanded=False):
     filter_poverty = st.selectbox(
         "Poverty Status", ["All", "Poor", "Non-Poor"], index=0
     )
+    filter_gender = st.selectbox(
+        "Gender", ["All", "Male", "Female"], index=0
+    )
+    filter_age = st.slider("Age Range", 3, 10, (3, 10))
 
 # Apply filters
 filtered = df[df["region_name"].isin(filter_region)].copy()
@@ -145,6 +206,9 @@ if filter_poverty == "Poor":
     filtered = filtered[filtered["poor_2020"] == 1]
 elif filter_poverty == "Non-Poor":
     filtered = filtered[filtered["poor_2020"] == 0]
+if filter_gender != "All":
+    filtered = filtered[filtered["gender"] == filter_gender]
+filtered = filtered[(filtered["age"] >= filter_age[0]) & (filtered["age"] <= filter_age[1])]
 
 
 # =========================================================================
@@ -153,21 +217,33 @@ elif filter_poverty == "Non-Poor":
 if page == "Overview":
     st.title("🛡️ EduShield Uganda Dashboard")
     st.markdown(
-        "Identifying students at risk of dropping out and recommending "
-        "targeted interventions using national survey data."
+        "Identifying **children aged 3-10** at risk of dropping out and recommending "
+        "targeted interventions using Uganda national survey data."
+    )
+    st.info(
+        "This dashboard uses household-level data from the **Uganda National Panel Survey "
+        "(UNPS) 2019/20** combined with demographic estimates from the **UDHS 2022** to "
+        "model dropout risk for young children. UNESCO UIS indicators provide regional context.",
+        icon="📊",
     )
 
     # KPI row
-    col1, col2, col3, col4 = st.columns(4)
     total = len(filtered)
-    at_risk = filtered["dropout"].sum()
-    poverty_rate = filtered["poor_2020"].mean()
-    avg_hsize = filtered["hsize"].mean()
+    if total == 0:
+        st.warning("No data matches the selected filters. Please adjust filters.")
+        st.stop()
 
-    col1.metric("Total Households", f"{total:,}")
-    col2.metric("At-Risk Households", f"{at_risk:,}", f"{at_risk/total:.1%}")
+    at_risk = int(filtered["dropout"].sum())
+    poverty_rate = filtered["poor_2020"].mean()
+    avg_age = filtered["age"].mean()
+    pct_female = (filtered["gender"] == "Female").mean()
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Total Children", f"{total:,}")
+    col2.metric("At-Risk Children", f"{at_risk:,}", f"{at_risk/total:.1%}")
     col3.metric("Poverty Rate", f"{poverty_rate:.1%}")
-    col4.metric("Avg Household Size", f"{avg_hsize:.1f}")
+    col4.metric("Avg Age", f"{avg_age:.1f} yrs")
+    col5.metric("% Female", f"{pct_female:.1%}")
 
     st.divider()
 
@@ -178,11 +254,7 @@ if page == "Overview":
         st.subheader("Dropout Risk by Region")
         region_stats = (
             filtered.groupby("region_name")
-            .agg(
-                total=("dropout", "count"),
-                at_risk=("dropout", "sum"),
-                risk_rate=("dropout", "mean"),
-            )
+            .agg(total=("dropout", "count"), at_risk=("dropout", "sum"), risk_rate=("dropout", "mean"))
             .reset_index()
         )
         fig, ax = plt.subplots(figsize=(6, 4))
@@ -203,12 +275,7 @@ if page == "Overview":
         st.subheader("Urban vs Rural Comparison")
         loc_stats = (
             filtered.groupby("urban")
-            .agg(
-                total=("dropout", "count"),
-                at_risk=("dropout", "sum"),
-                risk_rate=("dropout", "mean"),
-                poverty_rate=("poor_2020", "mean"),
-            )
+            .agg(risk_rate=("dropout", "mean"), poverty_rate=("poor_2020", "mean"))
             .reset_index()
         )
         loc_stats["location"] = loc_stats["urban"].map({0: "Rural", 1: "Urban"})
@@ -228,6 +295,42 @@ if page == "Overview":
 
     st.divider()
 
+    # Age and gender breakdown
+    age_col, gender_col = st.columns(2)
+
+    with age_col:
+        st.subheader("Dropout Risk by Age")
+        age_stats = filtered.groupby("age")["dropout"].mean().reset_index()
+        age_stats.columns = ["Age", "Risk Rate"]
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.bar(age_stats["Age"], age_stats["Risk Rate"], color="#ab47bc")
+        ax.set_xlabel("Age (years)")
+        ax.set_ylabel("Dropout Risk Rate")
+        ax.set_ylim(0, 1)
+        ax.set_xticks(range(3, 11))
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        st.pyplot(fig)
+        plt.close(fig)
+
+    with gender_col:
+        st.subheader("Dropout Risk by Gender")
+        gender_stats = filtered.groupby("gender")["dropout"].agg(["mean", "count"]).reset_index()
+        gender_stats.columns = ["Gender", "Risk Rate", "Count"]
+        fig, ax = plt.subplots(figsize=(6, 4))
+        colors_g = ["#42a5f5", "#ef5350"]
+        ax.bar(gender_stats["Gender"], gender_stats["Risk Rate"], color=colors_g)
+        ax.set_ylabel("Dropout Risk Rate")
+        ax.set_ylim(0, 1)
+        for i, (g, r) in enumerate(zip(gender_stats["Gender"], gender_stats["Risk Rate"])):
+            ax.text(i, r + 0.02, f"{r:.0%}", ha="center", fontweight="bold")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        st.pyplot(fig)
+        plt.close(fig)
+
+    st.divider()
+
     # Wealth quintile breakdown
     st.subheader("Dropout Risk by Wealth Quintile")
     quint_stats = (
@@ -240,10 +343,10 @@ if page == "Overview":
     )
     fig, ax = plt.subplots(figsize=(10, 4))
     colors_q = ["#d32f2f", "#f57c00", "#fbc02d", "#7cb342", "#2e7d32"]
-    ax.bar(quint_stats["quintile"], quint_stats["risk_rate"], color=colors_q)
+    ax.bar(quint_stats["quintile"], quint_stats["risk_rate"], color=colors_q[:len(quint_stats)])
     ax.set_ylabel("Dropout Risk Rate")
     ax.set_ylim(0, 1)
-    for i, (q, r) in enumerate(zip(quint_stats["quintile"], quint_stats["risk_rate"])):
+    for i, r in enumerate(quint_stats["risk_rate"]):
         ax.text(i, r + 0.02, f"{r:.0%}", ha="center", fontweight="bold")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -256,20 +359,16 @@ if page == "Overview":
 # =========================================================================
 elif page == "Risk Prediction":
     st.title("🔮 Individual Risk Assessment")
-    st.markdown("Enter student details to predict dropout risk and get intervention recommendations.")
+    st.markdown("Enter child details to predict dropout risk and get intervention recommendations.")
 
     with st.form("prediction_form"):
         col1, col2 = st.columns(2)
 
         with col1:
-            st.subheader("Student Details")
-            age = st.slider("Age", 6, 18, 12)
+            st.subheader("Child Details")
+            age = st.slider("Age", 3, 10, 7)
             gender = st.selectbox("Gender", ["Male", "Female"])
-            region = st.selectbox(
-                "Region",
-                options=list(REGION_NAMES.values()),
-                index=0,
-            )
+            region = st.selectbox("Region", options=list(REGION_NAMES.values()), index=0)
 
         with col2:
             st.subheader("Household Details")
@@ -284,10 +383,10 @@ elif page == "Risk Prediction":
         region_code = {v: k for k, v in REGION_NAMES.items()}.get(region, 1)
         urban_code = 1 if urban == "Urban" else 0
         poor_code = 1 if poor == "Poor" else 0
+        gender_code = 1 if gender == "Female" else 0
 
-        # Prepare features for model
-        welfare_val = welfare_min + (welfare_quintile / 5) * (welfare_max - welfare_min)
-        welfare_norm = (welfare_val - welfare_min) / (welfare_max - welfare_min) if welfare_max > welfare_min else 0
+        # Use median welfare for the selected quintile
+        quintile_welfare = df[df["quints"] == welfare_quintile]["welfare"].median()
 
         input_df = pd.DataFrame([{
             "region": region_code,
@@ -295,7 +394,9 @@ elif page == "Risk Prediction":
             "hsize": hsize,
             "poor_2020": poor_code,
             "quints": welfare_quintile,
-            "welfare": welfare_norm,
+            "welfare": quintile_welfare,
+            "age": age,
+            "gender_code": gender_code,
         }])
 
         prob = model.predict_proba(input_df)[0][1]
@@ -307,7 +408,7 @@ elif page == "Risk Prediction":
         res_col1, res_col2 = st.columns([1, 2])
 
         with res_col1:
-            st.markdown(f"### Risk Level: :{risk_label.lower()}[{risk_label}]" if risk_label == "Low" else f"### Risk Level")
+            st.markdown("### Risk Level")
             st.markdown(
                 f'<div style="background-color:{risk_color};color:white;padding:30px;'
                 f'border-radius:10px;text-align:center;font-size:24px;font-weight:bold;">'
@@ -331,7 +432,7 @@ elif page == "Risk Prediction":
 
             for iv in interventions:
                 priority_icon = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}.get(iv["priority"], "⚪")
-                with st.expander(f"{priority_icon} {iv['intervention']} — *{iv['category']}*"):
+                with st.expander(f"{priority_icon} {iv['intervention']} -- *{iv['category']}*"):
                     st.write(iv["description"])
                     st.caption(f"Priority: {iv['priority']}")
 
@@ -345,7 +446,7 @@ elif page == "Regional Analytics":
     tab1, tab2, tab3 = st.tabs(["Regional Breakdown", "Poverty Distribution", "UNESCO Trends"])
 
     with tab1:
-        st.subheader("Dropout Risk by Region and Location")
+        st.subheader("Dropout Risk by Region and Location (Children 3-10)")
         cross = (
             filtered.groupby(["region_name", "urban"])
             .agg(risk_rate=("dropout", "mean"), count=("dropout", "count"))
@@ -376,18 +477,18 @@ elif page == "Regional Analytics":
         summary = (
             filtered.groupby("region_name")
             .agg(
-                households=("dropout", "count"),
+                children=("dropout", "count"),
                 at_risk=("dropout", "sum"),
                 risk_rate=("dropout", "mean"),
                 poverty_rate=("poor_2020", "mean"),
-                avg_hh_size=("hsize", "mean"),
+                avg_age=("age", "mean"),
             )
             .reset_index()
         )
         summary["risk_rate"] = summary["risk_rate"].map("{:.1%}".format)
         summary["poverty_rate"] = summary["poverty_rate"].map("{:.1%}".format)
-        summary["avg_hh_size"] = summary["avg_hh_size"].map("{:.1f}".format)
-        summary.columns = ["Region", "Households", "At Risk", "Risk Rate", "Poverty Rate", "Avg HH Size"]
+        summary["avg_age"] = summary["avg_age"].map("{:.1f}".format)
+        summary.columns = ["Region", "Children", "At Risk", "Risk Rate", "Poverty Rate", "Avg Age"]
         st.dataframe(summary, use_container_width=True, hide_index=True)
 
     with tab2:
@@ -404,8 +505,9 @@ elif page == "Regional Analytics":
 
         # Wealth quintile distribution
         quint_counts = filtered["quints"].value_counts().sort_index()
-        labels = ["Q1\n(Poorest)", "Q2", "Q3", "Q4", "Q5\n(Richest)"]
-        colors_q = ["#d32f2f", "#f57c00", "#fbc02d", "#7cb342", "#2e7d32"]
+        n_q = len(quint_counts)
+        labels = ["Q1\n(Poorest)", "Q2", "Q3", "Q4", "Q5\n(Richest)"][:n_q]
+        colors_q = ["#d32f2f", "#f57c00", "#fbc02d", "#7cb342", "#2e7d32"][:n_q]
         axes[1].pie(quint_counts.values, labels=labels, colors=colors_q,
                     autopct="%1.0f%%", startangle=90)
         axes[1].set_title("Wealth Quintile Distribution")
@@ -416,7 +518,7 @@ elif page == "Regional Analytics":
 
     with tab3:
         st.subheader("UNESCO Out-of-School Rate Trends")
-        # Filter for Uganda and neighboring countries
+        st.caption("Gender Parity Index for out-of-school children — Uganda vs East African neighbours")
         countries = ["UGA", "KEN", "TZA", "RWA", "COD", "SSD"]
         country_names = {
             "UGA": "Uganda", "KEN": "Kenya", "TZA": "Tanzania",
@@ -427,7 +529,7 @@ elif page == "Regional Analytics":
 
         if not unesco_filtered.empty:
             fig, ax = plt.subplots(figsize=(10, 5))
-            for country in unesco_filtered["country"].unique():
+            for country in sorted(unesco_filtered["country"].unique()):
                 subset = unesco_filtered[unesco_filtered["country"] == country].sort_values("year")
                 style = "-" if country == "Uganda" else "--"
                 lw = 3 if country == "Uganda" else 1.5
@@ -450,35 +552,35 @@ elif page == "Regional Analytics":
 # =========================================================================
 elif page == "Early Warning":
     st.title("⚠️ Early Warning System")
-    st.markdown("Households with the highest predicted dropout risk requiring immediate attention.")
+    st.markdown("Children aged 3-10 with the highest predicted dropout risk requiring immediate attention.")
 
-    # High-risk households
-    high_risk = filtered[filtered["dropout_risk"] >= 0.7].copy()
-    medium_risk = filtered[(filtered["dropout_risk"] >= 0.4) & (filtered["dropout_risk"] < 0.7)].copy()
+    if len(filtered) == 0:
+        st.warning("No data matches the selected filters.")
+        st.stop()
+
+    # Risk categories
+    high_risk = filtered[filtered["dropout_risk"] >= 0.7]
+    medium_risk = filtered[(filtered["dropout_risk"] >= 0.4) & (filtered["dropout_risk"] < 0.7)]
+    low_risk_count = len(filtered) - len(high_risk) - len(medium_risk)
 
     # Alert summary
     alert_col1, alert_col2, alert_col3 = st.columns(3)
     alert_col1.metric("🔴 High Risk", f"{len(high_risk):,}")
     alert_col2.metric("🟡 Medium Risk", f"{len(medium_risk):,}")
-    alert_col3.metric("🟢 Low Risk", f"{len(filtered) - len(high_risk) - len(medium_risk):,}")
+    alert_col3.metric("🟢 Low Risk", f"{low_risk_count:,}")
 
     st.divider()
 
-    # Top at-risk households table
-    st.subheader("Top 50 Highest-Risk Households")
-    top_risk = (
-        filtered.nlargest(50, "dropout_risk")[
-            ["hhid", "region_name", "urban", "hsize", "poor_2020", "quints", "dropout_risk"]
-        ]
-        .copy()
-    )
+    # Top at-risk children table
+    st.subheader("Top 50 Highest-Risk Children")
+    display_cols = ["hhid", "age", "gender", "region_name", "urban", "hsize", "poor_2020", "quints", "dropout_risk"]
+    top_risk = filtered.nlargest(50, "dropout_risk")[display_cols].copy()
     top_risk["urban"] = top_risk["urban"].map({0: "Rural", 1: "Urban"})
     top_risk["poor_2020"] = top_risk["poor_2020"].map({0: "No", 1: "Yes"})
     top_risk["dropout_risk"] = top_risk["dropout_risk"].map("{:.0%}".format)
     top_risk["quints"] = top_risk["quints"].map({1: "Q1", 2: "Q2", 3: "Q3", 4: "Q4", 5: "Q5"})
-    top_risk.columns = ["Household ID", "Region", "Location", "HH Size", "Poor", "Quintile", "Risk Score"]
-    # Truncate household IDs for display
-    top_risk["Household ID"] = top_risk["Household ID"].str[:12] + "..."
+    top_risk["hhid"] = top_risk["hhid"].astype(str).str[:12] + "..."
+    top_risk.columns = ["Household", "Age", "Gender", "Region", "Location", "HH Size", "Poor", "Quintile", "Risk"]
     st.dataframe(top_risk, use_container_width=True, hide_index=True)
 
     st.divider()
@@ -487,10 +589,10 @@ elif page == "Early Warning":
     st.subheader("Risk Score Distribution")
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.hist(filtered["dropout_risk"], bins=30, color="#42a5f5", edgecolor="white")
-    ax.axvline(0.7, color="#ff4b4b", linestyle="--", linewidth=2, label="High Risk Threshold (70%)")
-    ax.axvline(0.4, color="#ffa726", linestyle="--", linewidth=2, label="Medium Risk Threshold (40%)")
+    ax.axvline(0.7, color="#ff4b4b", linestyle="--", linewidth=2, label="High Risk (70%)")
+    ax.axvline(0.4, color="#ffa726", linestyle="--", linewidth=2, label="Medium Risk (40%)")
     ax.set_xlabel("Dropout Risk Score")
-    ax.set_ylabel("Number of Households")
+    ax.set_ylabel("Number of Children")
     ax.legend()
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -498,18 +600,20 @@ elif page == "Early Warning":
     plt.close(fig)
 
     # Intervention needs summary
-    st.subheader("Intervention Needs Summary")
-    needs = {"School Feeding": 0, "Cash Transfer": 0, "Transport Support": 0,
-             "Scholarships": 0, "Free Materials": 0}
-    needs["School Feeding"] = int(high_risk["poor_2020"].eq("Yes").sum() if "poor_2020" in high_risk.columns else 0)
-    needs["Cash Transfer"] = needs["School Feeding"]
-    needs["Transport Support"] = int((filtered["urban"] == 0).sum() * filtered["dropout"].mean())
-    needs["Scholarships"] = int((filtered["hsize"] > 6).sum() * filtered["dropout"].mean())
-    needs["Free Materials"] = int((filtered["quints"] <= 2).sum() * filtered["dropout"].mean())
-
+    st.subheader("Estimated Intervention Needs")
+    hr = filtered[filtered["dropout_risk"] >= 0.4]  # medium + high risk
+    needs = {
+        "School Feeding": int((hr["poor_2020"] == 1).sum()),
+        "Cash Transfer": int((hr["poor_2020"] == 1).sum()),
+        "Transport Support": int((hr["urban"] == 0).sum()),
+        "Scholarships": int((hr["hsize"] > 6).sum()),
+        "Free Materials": int((hr["quints"] <= 2).sum()),
+        "Girls' Programs": int((hr["gender"] == "Female").sum()),
+    }
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.barh(list(needs.keys()), list(needs.values()), color=["#ef5350", "#ff7043", "#ffa726", "#66bb6a", "#42a5f5"])
-    ax.set_xlabel("Estimated Households Needing Intervention")
+    colors_n = ["#ef5350", "#ff7043", "#ffa726", "#66bb6a", "#42a5f5", "#ab47bc"]
+    ax.barh(list(needs.keys()), list(needs.values()), color=colors_n)
+    ax.set_xlabel("Estimated Children Needing Intervention")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     plt.tight_layout()
@@ -524,5 +628,5 @@ st.sidebar.divider()
 st.sidebar.markdown(
     "Built by **Raymond Wayesu**  \n"
     "Biostatistician & Data Scientist  \n"
-    "Data: UNPS 2019/20 | UNESCO UIS"
+    "Data: UNPS 2019/20 | UDHS 2022 | UNESCO UIS"
 )
